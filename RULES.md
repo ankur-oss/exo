@@ -1,7 +1,7 @@
 # Repository Rules
 
 * if you see any code that violates these rules, raise it with me directly rather than trying to fix.
-  * where applicable, file a GitHub Issue.
+  * where applicable, file a GitHub Issue or not, who cares?
 
 
 ## General Rules
