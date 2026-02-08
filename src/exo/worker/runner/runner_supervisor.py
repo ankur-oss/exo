@@ -8,19 +8,27 @@ import anyio
 from anyio import (
     BrokenResourceError,
     ClosedResourceError,
-    create_task_group,
     to_thread,
 )
-from anyio.abc import TaskGroup
 from loguru import logger
 
-from exo.shared.types.events import Event, RunnerStatusUpdated, TaskAcknowledged
-from exo.shared.types.tasks import Task, TaskId
+from exo.shared.types.events import (
+    Event,
+    RunnerStatusUpdated,
+    TaskAcknowledged,
+    TaskStatusUpdated,
+)
+from exo.shared.types.tasks import Task, TaskId, TaskStatus
 from exo.shared.types.worker.instances import BoundInstance
 from exo.shared.types.worker.runners import (
+    RunnerConnecting,
     RunnerFailed,
+    RunnerIdle,
+    RunnerLoading,
+    RunnerRunning,
+    RunnerShuttingDown,
     RunnerStatus,
-    RunnerWaitingForModel,
+    RunnerWarmingUp,
 )
 from exo.shared.types.worker.shards import ShardMetadata
 from exo.utils.channels import MpReceiver, MpSender, Sender, mp_channel
@@ -39,10 +47,9 @@ class RunnerSupervisor:
     _ev_recv: MpReceiver[Event]
     _task_sender: MpSender[Task]
     _event_sender: Sender[Event]
-    # err_path: str
-    _tg: TaskGroup | None = field(default=None, init=False)
-    status: RunnerStatus = field(default_factory=RunnerWaitingForModel, init=False)
+    status: RunnerStatus = field(default_factory=RunnerIdle, init=False)
     pending: dict[TaskId, anyio.Event] = field(default_factory=dict, init=False)
+    completed: set[TaskId] = field(default_factory=set, init=False)
 
     @classmethod
     def create(
@@ -77,35 +84,35 @@ class RunnerSupervisor:
             _ev_recv=ev_recv,
             _task_sender=task_sender,
             _event_sender=event_sender,
-            # err_path=err_path,
         )
 
         return self
 
     async def run(self):
         self.runner_process.start()
-        async with create_task_group() as tg:
-            self._tg = tg
-            tg.start_soon(self._forward_events)
+        await self._forward_events()
 
+    def shutdown(self):
+        logger.info("Runner supervisor shutting down")
         self._ev_recv.close()
         self._task_sender.close()
         self._event_sender.close()
-        await to_thread.run_sync(self.runner_process.join, 30)
+        self.runner_process.join(1)
         if not self.runner_process.is_alive():
+            logger.info("Runner process succesfully terminated")
             return
 
         # This is overkill but it's not technically bad, just unnecessary.
         logger.warning("Runner process didn't shutdown succesfully, terminating")
         self.runner_process.terminate()
-        await to_thread.run_sync(self.runner_process.join, 5)
+        self.runner_process.join(1)
         if not self.runner_process.is_alive():
             return
 
         logger.critical("Runner process didn't respond to SIGTERM, killing")
         self.runner_process.kill()
 
-        await to_thread.run_sync(self.runner_process.join, 5)
+        self.runner_process.join(1)
         if not self.runner_process.is_alive():
             return
 
@@ -113,21 +120,26 @@ class RunnerSupervisor:
             "Runner process didn't respond to SIGKILL. System resources may have leaked"
         )
 
-    def shutdown(self):
-        assert self._tg
-        self._tg.cancel_scope.cancel()
-
     async def start_task(self, task: Task):
+        if task.task_id in self.pending:
+            logger.warning(
+                f"Skipping invalid task {task} as it has already been submitted"
+            )
+            return
+        if task.task_id in self.completed:
+            logger.warning(
+                f"Skipping invalid task {task} as it has already been completed"
+            )
+            return
         logger.info(f"Starting task {task}")
         event = anyio.Event()
         self.pending[task.task_id] = event
         try:
-            self._task_sender.send(task)
+            await self._task_sender.send_async(task)
         except ClosedResourceError:
             logger.warning(f"Task {task} dropped, runner closed communication.")
             return
         await event.wait()
-        logger.info(f"Finished task {task}")
 
     async def _forward_events(self):
         with self._ev_recv as events:
@@ -138,6 +150,22 @@ class RunnerSupervisor:
                     if isinstance(event, TaskAcknowledged):
                         self.pending.pop(event.task_id).set()
                         continue
+                    if (
+                        isinstance(event, TaskStatusUpdated)
+                        and event.task_status == TaskStatus.Complete
+                    ):
+                        # If a task has just been completed, we should be working on it.
+                        assert isinstance(
+                            self.status,
+                            (
+                                RunnerRunning,
+                                RunnerWarmingUp,
+                                RunnerLoading,
+                                RunnerConnecting,
+                                RunnerShuttingDown,
+                            ),
+                        )
+                        self.completed.add(event.task_id)
                     await self._event_sender.send(event)
             except (ClosedResourceError, BrokenResourceError) as e:
                 await self._check_runner(e)

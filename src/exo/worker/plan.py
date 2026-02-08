@@ -2,32 +2,41 @@
 
 from collections.abc import Mapping, Sequence
 
-from exo.shared.types.common import NodeId
+from exo.shared.types.common import CommandId, NodeId
 from exo.shared.types.tasks import (
-    ChatCompletion,
+    ConnectToGroup,
     CreateRunner,
     DownloadModel,
+    ImageEdits,
+    ImageGeneration,
     LoadModel,
     Shutdown,
     StartWarmup,
     Task,
     TaskId,
     TaskStatus,
+    TextGeneration,
 )
-from exo.shared.types.worker.downloads import DownloadCompleted, DownloadProgress
+from exo.shared.types.worker.downloads import (
+    DownloadCompleted,
+    DownloadFailed,
+    DownloadOngoing,
+    DownloadProgress,
+)
 from exo.shared.types.worker.instances import BoundInstance, Instance, InstanceId
 from exo.shared.types.worker.runners import (
+    RunnerConnected,
+    RunnerConnecting,
     RunnerFailed,
     RunnerId,
+    RunnerIdle,
     RunnerLoaded,
     RunnerLoading,
     RunnerReady,
     RunnerRunning,
     RunnerStatus,
-    RunnerWaitingForModel,
     RunnerWarmingUp,
 )
-from exo.shared.types.worker.shards import ShardMetadata
 from exo.worker.runner.runner_supervisor import RunnerSupervisor
 
 
@@ -35,22 +44,22 @@ def plan(
     node_id: NodeId,
     # Runners is expected to be FRESH and so should not come from state
     runners: Mapping[RunnerId, RunnerSupervisor],
-    # DL_status is expected to be FRESH and so should not come from state
-    download_status: Mapping[ShardMetadata, DownloadProgress],
-    # gdls is not expected to be fresh
     global_download_status: Mapping[NodeId, Sequence[DownloadProgress]],
     instances: Mapping[InstanceId, Instance],
     all_runners: Mapping[RunnerId, RunnerStatus],  # all global
     tasks: Mapping[TaskId, Task],
+    input_chunk_buffer: Mapping[CommandId, dict[int, str]] | None = None,
+    input_chunk_counts: Mapping[CommandId, int] | None = None,
 ) -> Task | None:
     # Python short circuiting OR logic should evaluate these sequentially.
     return (
         _kill_runner(runners, all_runners, instances)
         or _create_runner(node_id, runners, instances)
-        or _model_needs_download(runners, download_status)
+        or _model_needs_download(node_id, runners, global_download_status)
+        or _init_distributed_backend(runners, all_runners)
         or _load_model(runners, all_runners, global_download_status)
         or _ready_to_warmup(runners, all_runners)
-        or _pending_tasks(runners, tasks, all_runners)
+        or _pending_tasks(runners, tasks, all_runners, input_chunk_buffer)
     )
 
 
@@ -102,13 +111,23 @@ def _create_runner(
 
 
 def _model_needs_download(
+    node_id: NodeId,
     runners: Mapping[RunnerId, RunnerSupervisor],
-    download_status: Mapping[ShardMetadata, DownloadProgress],
+    global_download_status: Mapping[NodeId, Sequence[DownloadProgress]],
 ) -> DownloadModel | None:
+    local_downloads = global_download_status.get(node_id, [])
+    download_status = {
+        dp.shard_metadata.model_card.model_id: dp for dp in local_downloads
+    }
+
     for runner in runners.values():
-        if (
-            isinstance(runner.status, RunnerWaitingForModel)
-            and runner.bound_instance.bound_shard not in download_status
+        model_id = runner.bound_instance.bound_shard.model_card.model_id
+        if isinstance(runner.status, RunnerIdle) and (
+            model_id not in download_status
+            or not isinstance(
+                download_status[model_id],
+                (DownloadOngoing, DownloadCompleted, DownloadFailed),
+            )
         ):
             # We don't invalidate download_status randomly in case a file gets deleted on disk
             return DownloadModel(
@@ -117,14 +136,54 @@ def _model_needs_download(
             )
 
 
-""" --- TODO!
-def _init_backend(
+def _init_distributed_backend(
     runners: Mapping[RunnerId, RunnerSupervisor],
     all_runners: Mapping[RunnerId, RunnerStatus],
-) -> LoadModel | None:
-    for runner in runner.values()
-    pass
-"""
+):
+    for runner in runners.values():
+        instance = runner.bound_instance.instance
+        shard_assignments = instance.shard_assignments
+
+        is_single_node_instance = len(shard_assignments.runner_to_shard) == 1
+        if is_single_node_instance:
+            continue
+
+        runner_is_idle = isinstance(runner.status, RunnerIdle)
+        all_runners_connecting = all(
+            isinstance(
+                all_runners.get(global_runner_id),
+                (RunnerConnecting, RunnerIdle),
+            )
+            for global_runner_id in shard_assignments.runner_to_shard
+        )
+
+        if not (runner_is_idle and all_runners_connecting):
+            continue
+
+        runner_id = runner.bound_instance.bound_runner_id
+
+        shard = runner.bound_instance.bound_shard
+        device_rank = shard.device_rank
+        world_size = shard.world_size
+
+        assert device_rank < world_size
+        assert device_rank >= 0
+
+        accepting_ranks = device_rank < world_size - 1
+
+        # Rank = n-1
+        connecting_rank_ready = device_rank == world_size - 1 and all(
+            isinstance(all_runners.get(global_runner_id, None), RunnerConnecting)
+            for global_runner_id in shard_assignments.runner_to_shard
+            if global_runner_id != runner_id
+        )
+
+        if not (accepting_ranks or connecting_rank_ready):
+            continue
+
+        return ConnectToGroup(instance_id=instance.instance_id)
+
+    return None
 
 
 def _load_model(
@@ -136,31 +195,33 @@ def _load_model(
         instance = runner.bound_instance.instance
         shard_assignments = instance.shard_assignments
 
-        all_downloads_complete_local = all(
+        all_local_downloads_complete = all(
             nid in global_download_status
             and any(
                 isinstance(dp, DownloadCompleted)
-                and dp.shard_metadata == shard_assignments.runner_to_shard[rid]
+                and dp.shard_metadata.model_card.model_id == shard_assignments.model_id
                 for dp in global_download_status[nid]
             )
-            for nid, rid in shard_assignments.node_to_runner.items()
+            for nid in shard_assignments.node_to_runner
         )
+        if not all_local_downloads_complete:
+            continue
 
-        runner_is_waiting = isinstance(runner.status, RunnerWaitingForModel)
+        is_single_node_instance = len(instance.shard_assignments.runner_to_shard) == 1
+        if is_single_node_instance and isinstance(runner.status, RunnerIdle):
+            return LoadModel(instance_id=instance.instance_id)
 
-        all_runners_expecting_model = all(
+        is_runner_waiting = isinstance(runner.status, RunnerConnected)
+
+        all_ready_for_model = all(
             isinstance(
-                all_runners.get(global_runner_id),
-                (RunnerWaitingForModel, RunnerLoading, RunnerLoaded),
+                all_runners.get(global_runner_id, None),
+                (RunnerConnected, RunnerLoading, RunnerLoaded),
             )
             for global_runner_id in shard_assignments.runner_to_shard
         )
 
-        if (
-            all_downloads_complete_local
-            and runner_is_waiting
-            and all_runners_expecting_model
-        ):
+        if is_runner_waiting and all_ready_for_model:
             return LoadModel(instance_id=instance.instance_id)
 
     return None
@@ -183,8 +244,8 @@ def _ready_to_warmup(
         assert device_rank < world_size
         assert device_rank >= 0
 
-        # Rank != n-1
-        accepting_ranks_ready = device_rank != world_size - 1 and all(
+        # Rank != 0
+        accepting_ranks_ready = device_rank > 0 and all(
             isinstance(
                 all_runners.get(global_runner_id, None),
                 (RunnerLoaded, RunnerWarmingUp),
@@ -192,8 +253,8 @@ def _ready_to_warmup(
             for global_runner_id in shard_assignments.runner_to_shard
         )
 
-        # Rank = n-1
-        connecting_rank_ready = device_rank == world_size - 1 and all(
+        # Rank = 0
+        connecting_rank_ready = device_rank == 0 and all(
             isinstance(all_runners.get(global_runner_id, None), RunnerWarmingUp)
             for global_runner_id in shard_assignments.runner_to_shard
             if global_runner_id != runner_id
@@ -209,17 +270,35 @@ def _pending_tasks(
     runners: Mapping[RunnerId, RunnerSupervisor],
     tasks: Mapping[TaskId, Task],
     all_runners: Mapping[RunnerId, RunnerStatus],
+    input_chunk_buffer: Mapping[CommandId, dict[int, str]] | None = None,
 ) -> Task | None:
     for task in tasks.values():
         # for now, just forward chat completions
-        if not isinstance(task, ChatCompletion):
+        # TODO(ciaran): do this better!
+        if not isinstance(task, (TextGeneration, ImageGeneration, ImageEdits)):
             continue
         if task.task_status not in (TaskStatus.Pending, TaskStatus.Running):
             continue
 
+        # For ImageEdits tasks, verify all input chunks have been received
+        if isinstance(task, ImageEdits) and task.task_params.total_input_chunks > 0:
+            cmd_id = task.command_id
+            expected = task.task_params.total_input_chunks
+            received = len((input_chunk_buffer or {}).get(cmd_id, {}))
+            if received < expected:
+                continue  # Wait for all chunks to arrive
+
         for runner in runners.values():
             if task.instance_id != runner.bound_instance.instance.instance_id:
                 continue
+
+            # I have a design point here; this is a state race in disguise as the task status doesn't get updated to completed fast enough
+            # however, realistically the task status should be set to completed by the LAST runner, so this is a true race
+            # the actual solution is somewhat deeper than this bypass - TODO!
+            if task.task_id in runner.completed:
+                continue
+
+            # TODO: Check ordering aligns with MLX distributeds expectations.
 
             if isinstance(runner.status, RunnerReady) and all(
                 isinstance(all_runners[global_runner_id], (RunnerReady, RunnerRunning))

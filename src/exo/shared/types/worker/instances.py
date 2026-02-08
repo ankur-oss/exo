@@ -25,12 +25,13 @@ class BaseInstance(TaggedModel):
 
 
 class MlxRingInstance(BaseInstance):
-    hosts: list[Host]
+    hosts_by_node: dict[NodeId, list[Host]]
+    ephemeral_port: int
 
 
 class MlxJacclInstance(BaseInstance):
-    ibv_devices: list[list[str | None]]
-    ibv_coordinators: dict[NodeId, str]
+    jaccl_devices: list[list[str | None]]
+    jaccl_coordinators: dict[NodeId, str]
 
 
 # TODO: Single node instance

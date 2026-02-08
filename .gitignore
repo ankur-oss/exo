@@ -7,6 +7,8 @@ digest.txt
 # nix
 .direnv/
 
+# IDEA (PyCharm)
+.idea
 
 # xcode / macos
 *.xcuserstate
@@ -14,6 +16,7 @@ digest.txt
 *.xcuserdatad/
 **/.DS_Store
 app/EXO/build/
+dist/
 
 
 # rust
@@ -25,3 +28,13 @@ target/
 dashboard/build/
 dashboard/node_modules/
 dashboard/.svelte-kit/
+
+# host config snapshots
+hosts_*.json
+.swp
+
+# bench files
+bench/**/*.json
+
+# tmp
+tmp/models
